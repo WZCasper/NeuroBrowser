@@ -1,0 +1,47 @@
+name: Build Windows EXE
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyQt6==6.10.2 PyQt6-WebEngine==6.10.0 psutil pyinstaller==6.22.3
+
+      - name: Build EXE
+        run: |
+          pyinstaller --noconfirm --windowed --name NeuroBrowser --icon icon.ico --collect-all PyQt6 --collect-submodules PyQt6.QtWebEngineCore neuro_browser.py
+
+      - name: Package
+        run: |
+          Compress-Archive -Path dist\NeuroBrowser\* -DestinationPath NeuroBrowser-windows.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NeuroBrowser-windows
+          path: NeuroBrowser-windows.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: NeuroBrowser-windows.zip
