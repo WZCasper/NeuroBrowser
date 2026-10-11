@@ -50,21 +50,37 @@ _log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message
 app_logger.addHandler(_log_handler)
 
 # Флаги Chromium для совместимости с видеоплеерами и аппаратного ускорения.
-# ВАЖНО: --ignore-certificate-errors и --disable-web-security здесь намеренно НЕ используются:
-# это флаги уровня процесса, они действовали бы на все открытые сайты, а не только на плееры,
-# и отключали бы проверку HTTPS-сертификата и политику same-origin везде, делая пользователя
-# уязвимым к перехвату трафика на любом обычном сайте. Кросс-доменные iframe (на которых
-# держится большинство встраиваемых плееров) загружаются корректно и без этих флагов —
-# это проверено отдельно. Смешанный контент (HTTP-ресурсы на HTTPS-странице), который
-# нередко встречается у пиратских CDN, разрешается точечно на уровне профиля ниже
-# (QWebEngineSettings.WebAttribute.AllowRunningInsecureContent), а не глобально.
+#
+# --disable-web-security ВОЗВРАЩЁН намеренно, после прямой проверки. Он отключает
+# CORS-проверку для fetch/XHR-запросов между разными доменами. Большинство видеобалансеров
+# агрегаторов фильмов (Alloha, Voize, Kodik и похожие) отдают .m3u8/.mpd плейлисты и видеочанки
+# с CDN-домена, ОТЛИЧНОГО от домена самого iframe-плеера, и не всегда настраивают корректные
+# CORS-заголовки на своей стороне. Без этого флага браузер блокирует такие запросы как
+# небезопасные (проверено отдельным тестом: идентичный кросс-доменный fetch() проходит
+# с флагом и отклоняется с ошибкой "Failed to fetch" без него) — то есть часть плееров
+# вообще не получает видеопоток. Кросс-доменная ЗАГРУЗКА IFRAME (сам плеер появляется на
+# странице) работает и без этого флага — проблема именно в fetch/XHR ВНУТРИ уже загруженного
+# плеера, поэтому обойтись без флага для этого браузера не получилось.
+#
+# --ignore-certificate-errors НЕ возвращён: он не требовался ни для одного из проверенных
+# случаев (видео играет и без него), и отключает проверку HTTPS-сертификата на ВСЕХ
+# сайтах, а не только внутри плеера — риск здесь несоразмерен пользе. Обработка ошибок
+# сертификата сделана точечно и прозрачно через NeuroWebEnginePage.certificateError ниже:
+# ошибка принимается (чтобы не блокировать воспроизведение у CDN с самоподписанными
+# сертификатами), но каждый такой случай логируется в neurobrowser.log.
+#
+# Честная оговорка: --disable-web-security — это компромисс, типичный для браузеров,
+# заточенных под обход ограничений пиратских видеосервисов. Он снижает защиту от
+# CSRF/XSS-атак для ВСЕХ открытых сайтов, не только для плееров (технически разделить
+# это по доменам нельзя — флаг действует на уровне процесса Chromium целиком).
 os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     "--no-sandbox "
     "--autoplay-policy=no-user-gesture-required "
     "--enable-gpu-rasterization "
     "--enable-accelerated-2d-canvas "
     "--enable-accelerated-video-decode "
-    "--enable-webgl"
+    "--enable-webgl "
+    "--disable-web-security"
 )
 
 from PyQt6.QtCore import QUrl, QTimer, Qt
@@ -900,6 +916,24 @@ class SessionInstance:
         # обработает deleteLater() для всех его страниц выше.
         QTimer.singleShot(0, self.profile.deleteLater)
 
+class _FullscreenPlayerWindow(QWidget):
+    """ Отдельное окно полноэкранного плеера. Пользователь может закрыть его
+    системным крестиком в заголовке окна — это НЕ должно просто закрыть окно
+    (тогда QWebEngineView с активным видео потеряется: не вернётся на вкладку,
+    а звук продолжит идти в оторванном от интерфейса виджете). Поэтому крестик
+    перенаправляется на тот же exit_video_fullscreen, что и Esc/F11. """
+
+    def __init__(self, main_window):
+        super().__init__()
+        self._main_window = main_window
+        self.setWindowTitle("NeuroBrowser — Полный экран")
+        self.setWindowFlag(Qt.WindowType.Window, True)
+
+    def closeEvent(self, event):
+        event.ignore()  # не даём Qt уничтожить окно и его дочерний view напрямую
+        self._main_window.exit_video_fullscreen()
+
+
 class NeuroBrowserApp(QMainWindow):
     def __init__(self, app_icon):
         super().__init__()
@@ -1074,8 +1108,7 @@ class NeuroBrowserApp(QMainWindow):
         self._fs_index = idx
         self._fs_restore_tab_label = tabs.tabText(idx)
 
-        self._fs_window = QWidget()
-        self._fs_window.setWindowTitle("NeuroBrowser — Полный экран")
+        self._fs_window = _FullscreenPlayerWindow(self)
         self._fs_window.setStyleSheet("background-color: #000000;")
         self._fs_layout = QVBoxLayout(self._fs_window)
         self._fs_layout.setContentsMargins(0, 0, 0, 0)
@@ -1085,6 +1118,9 @@ class NeuroBrowserApp(QMainWindow):
         tabs.removeTab(idx)
         self._fs_layout.addWidget(view)
         view.setParent(self._fs_window)
+        # Без явного show() после смены родителя QWebEngineView иногда не перерисовывается
+        # (остаётся чёрным), т.к. его composited-слой привязан к старому окну.
+        view.show()
 
         self._fs_window.installEventFilter(self)
         view.installEventFilter(self)
@@ -1092,26 +1128,36 @@ class NeuroBrowserApp(QMainWindow):
         view.setFocus()
 
     def exit_video_fullscreen(self):
-        """ Возврат вкладки на её место из полного экрана """
+        """ Возврат вкладки на её место из полного экрана. Вызывается и по Esc/F11
+        (через eventFilter), и системным крестиком окна (через _FullscreenPlayerWindow
+        .closeEvent) — поэтому защищена от повторного вызова, если оба пути сработают
+        почти одновременно. """
         view = getattr(self, "_fs_view", None)
         if view is None:
-            return
+            return  # уже вышли из полноэкранного режима — ничего не делаем
         session = getattr(self, "_fs_session", None)
         idx = getattr(self, "_fs_index", 0)
+        fs_window = self._fs_window
+
+        # Сразу обнуляем _fs_view: если exit_video_fullscreen вызовется повторно
+        # (например, closeEvent успеет сработать после уже начатого выхода по Esc),
+        # проверка выше отсечёт повторный проход раньше, чем он тронет виджеты.
+        self._fs_view = None
 
         view.removeEventFilter(self)
-        self._fs_window.removeEventFilter(self)
+        fs_window.removeEventFilter(self)
         self._fs_layout.removeWidget(view)
+        view.setParent(None)
 
         if session is not None:
             tabs = session.tabs_widget
             insert_at = min(idx, tabs.count())
             tabs.insertTab(insert_at, view, self._fs_restore_tab_label)
             tabs.setCurrentIndex(insert_at)
+            view.show()
 
-        self._fs_window.hide()
-        self._fs_window.deleteLater()
-        self._fs_view = None
+        fs_window.hide()
+        fs_window.deleteLater()
         self._fs_session = None
         self._fs_window = None
         self._fs_layout = None
