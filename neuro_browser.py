@@ -4,8 +4,12 @@ import json
 import math
 import ctypes
 import re
+import logging
+from logging.handlers import RotatingFileHandler
 from urllib.parse import quote_plus
 import psutil
+
+APP_VERSION = "2.1.0"
 
 # Настройка процессов Windows для иконки в панели задач
 APP_ID = 'casper.neurobrowser.2.0'
@@ -14,17 +18,53 @@ try:
 except Exception:
     pass
 
-# Флаги Chromium для максимальной совместимости с видеоплеерами, Widevine и ускорением
+
+def get_app_data_dir() -> str:
+    """ Постоянная папка для данных приложения (профили сессий, состояние, логи).
+    На Windows это %APPDATA%\\NeuroBrowser — не зависит от того, откуда и как
+    запущен .exe (ярлык, Program Files, другой рабочий каталог). На других ОС
+    (тестовая среда разработки, запуск из исходников) — запасной вариант рядом
+    со скриптом, чтобы код оставался кроссплатформенным при разработке. """
+    base = os.environ.get("APPDATA")
+    if not base:
+        # Не Windows или переменная не установлена: используем домашнюю папку пользователя
+        base = os.path.join(os.path.expanduser("~"), ".neurobrowser")
+        os.makedirs(base, exist_ok=True)
+        return base
+    app_dir = os.path.join(base, "NeuroBrowser")
+    os.makedirs(app_dir, exist_ok=True)
+    return app_dir
+
+
+APP_DATA_DIR = get_app_data_dir()
+
+# Логирование в файл: приложение собирается с --windowed, поэтому консоли у пользователя
+# нет, и print() никто не увидит. Лог ротируется, чтобы не расти бесконечно.
+app_logger = logging.getLogger("neurobrowser")
+app_logger.setLevel(logging.INFO)
+_log_handler = RotatingFileHandler(
+    os.path.join(APP_DATA_DIR, "neurobrowser.log"),
+    maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8"
+)
+_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+app_logger.addHandler(_log_handler)
+
+# Флаги Chromium для совместимости с видеоплеерами и аппаратного ускорения.
+# ВАЖНО: --ignore-certificate-errors и --disable-web-security здесь намеренно НЕ используются:
+# это флаги уровня процесса, они действовали бы на все открытые сайты, а не только на плееры,
+# и отключали бы проверку HTTPS-сертификата и политику same-origin везде, делая пользователя
+# уязвимым к перехвату трафика на любом обычном сайте. Кросс-доменные iframe (на которых
+# держится большинство встраиваемых плееров) загружаются корректно и без этих флагов —
+# это проверено отдельно. Смешанный контент (HTTP-ресурсы на HTTPS-странице), который
+# нередко встречается у пиратских CDN, разрешается точечно на уровне профиля ниже
+# (QWebEngineSettings.WebAttribute.AllowRunningInsecureContent), а не глобально.
 os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
-    "--ignore-certificate-errors "
     "--no-sandbox "
     "--autoplay-policy=no-user-gesture-required "
     "--enable-gpu-rasterization "
     "--enable-accelerated-2d-canvas "
     "--enable-accelerated-video-decode "
-    "--enable-webgl "
-    "--disable-web-security "
-    "--allow-running-insecure-content"
+    "--enable-webgl"
 )
 
 from PyQt6.QtCore import QUrl, QTimer, Qt
@@ -40,6 +80,23 @@ from PyQt6.QtWebEngineCore import (
     QWebEngineProfile, QWebEnginePage, QWebEngineUrlRequestInterceptor,
     QWebEngineScript, QWebEngineSettings, QWebEngineUrlRequestInfo
 )
+
+class NeuroWebEnginePage(QWebEnginePage):
+    """ Страница с явной, логируемой обработкой ошибок TLS-сертификата.
+    Многие плееры используют самоподписанные или просроченные сертификаты на CDN,
+    поэтому ошибка принимается (чтобы видео продолжало работать), но не молча:
+    она логируется через app_logger, и её можно посмотреть в файле логов. """
+
+    def certificateError(self, error):
+        try:
+            app_logger.warning(
+                "Ошибка TLS-сертификата принята для %s: %s",
+                error.url().toString(), error.description()
+            )
+        except Exception:
+            pass
+        return True  # принять ошибку и продолжить загрузку (без этого видео не воспроизведётся)
+
 
 class AdBlockUrlInterceptor(QWebEngineUrlRequestInterceptor):
     """ Сетевой блокиратор рекламы. Блокирует только рекламные скрипты, картинки и XHR.
@@ -491,7 +548,6 @@ def get_app_icon():
     painter.drawEllipse(116, 116, 24, 24)
     painter.end()
     
-    pixmap.save(os.path.join(os.getcwd(), "icon.png"), "PNG")
     return QIcon(pixmap)
 
 def smart_parse_url(input_text: str) -> QUrl:
@@ -651,7 +707,7 @@ class SessionInstance:
         self.name = f"Session [{str(session_id).zfill(2)}]"
         self.parent_window = parent_window
 
-        profile_path = os.path.abspath(os.path.join(os.getcwd(), "profiles", f"profile_{session_id}"))
+        profile_path = os.path.join(APP_DATA_DIR, "profiles", f"profile_{session_id}")
         os.makedirs(profile_path, exist_ok=True)
 
         self.profile = QWebEngineProfile(f"NeuroProfile_{session_id}", parent_window)
@@ -736,7 +792,7 @@ class SessionInstance:
             self.parent_window.exit_video_fullscreen()
 
     def add_tab(self, url_str="about:home") -> QWebEngineView:
-        page = QWebEnginePage(self.profile, self.parent_window)
+        page = NeuroWebEnginePage(self.profile, self.parent_window)
 
         view = QWebEngineView()
         view.setPage(page)
@@ -825,10 +881,29 @@ class SessionInstance:
                 urls.append(v.url().toString())
         return urls
 
+    def release_resources(self):
+        """ Явно закрывает все страницы сессии перед удалением её профиля.
+        Без этого QWebEngineProfile остаётся в памяти без ссылки после удаления
+        сессии (видно в логах как 'Release of profile requested but WebEnginePage
+        still not deleted'), и при частом создании/удалении сессий память растёт. """
+        for i in range(self.tabs_widget.count() - 1):
+            v = self.tabs_widget.widget(i)
+            if isinstance(v, QWebEngineView):
+                page = v.page()
+                if page is not None:
+                    # Останавливаем любую активную загрузку/воспроизведение перед удалением
+                    page.setUrl(QUrl("about:blank"))
+                    page.deleteLater()
+                v.setParent(None)
+
+        # Профиль освобождается в следующем цикле событий, после того как Qt
+        # обработает deleteLater() для всех его страниц выше.
+        QTimer.singleShot(0, self.profile.deleteLater)
+
 class NeuroBrowserApp(QMainWindow):
     def __init__(self, app_icon):
         super().__init__()
-        self.setWindowTitle("NeuroBrowser - Multi-Account Neural Suite")
+        self.setWindowTitle(f"NeuroBrowser {APP_VERSION} - Multi-Account Neural Suite")
         self.resize(1400, 850)
         self.setStyleSheet(NEURO_STYLESHEET)
         self.setWindowIcon(app_icon)
@@ -907,6 +982,7 @@ class NeuroBrowserApp(QMainWindow):
 
         self.btn_donate = QPushButton("Donate")
         self.btn_donate.setObjectName("btnDonate")
+        self.btn_donate.setToolTip(f"NeuroBrowser {APP_VERSION}")
         self.btn_donate.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://www.donationalerts.com/r/wz_casper")))
         header_layout.addWidget(self.btn_donate)
 
@@ -1094,6 +1170,8 @@ class NeuroBrowserApp(QMainWindow):
             item = self.session_list_widget.takeItem(index)
             del item
 
+            session_to_delete.release_resources()
+
             session_to_delete.tabs_widget.hide()
             session_to_delete.tabs_widget.setParent(None)
             session_to_delete.tabs_widget.deleteLater()
@@ -1187,13 +1265,14 @@ class NeuroBrowserApp(QMainWindow):
     def save_state(self):
         state = [{"id": s.session_id, "name": s.name, "urls": s.get_all_urls()} for s in self.sessions]
         try:
-            with open(os.path.join(os.getcwd(), "sessions_config.json"), "w", encoding="utf-8") as f:
+            with open(os.path.join(APP_DATA_DIR, "sessions_config.json"), "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"Ошибка сохранения состояния: {e}")
+            app_logger.error("Ошибка сохранения состояния сессий: %s", e)
+            self.show_status_message("Не удалось сохранить сессии — подробности в журнале", is_error=True)
 
     def load_state(self):
-        state_path = os.path.join(os.getcwd(), "sessions_config.json")
+        state_path = os.path.join(APP_DATA_DIR, "sessions_config.json")
         if os.path.exists(state_path):
             try:
                 with open(state_path, "r", encoding="utf-8") as f:
@@ -1203,10 +1282,19 @@ class NeuroBrowserApp(QMainWindow):
                         self.add_new_session(saved_name=item.get("name"), saved_urls=item.get("urls"))
                     return
             except Exception as e:
-                print(f"Ошибка загрузки состояния: {e}")
-        
+                app_logger.error("Ошибка загрузки состояния сессий: %s", e)
+                self.show_status_message("Не удалось загрузить сохранённые сессии — подробности в журнале", is_error=True)
+
         for _ in range(3):
             self.add_new_session()
+
+    def show_status_message(self, text: str, is_error: bool = False, duration_ms: int = 5000):
+        """ Короткое уведомление в заголовке окна. Не требует отдельного UI-виджета
+        и работает независимо от того, какая вкладка/сессия сейчас активна. """
+        self._base_window_title = getattr(self, "_base_window_title", self.windowTitle())
+        prefix = "⚠ " if is_error else "✓ "
+        self.setWindowTitle(f"{prefix}{text}")
+        QTimer.singleShot(duration_ms, lambda: self.setWindowTitle(self._base_window_title))
 
     def update_hardware_stats(self):
         try:
@@ -1215,11 +1303,21 @@ class NeuroBrowserApp(QMainWindow):
             self.lbl_cpu.setText(f"CPU: {cpu_usage:.1f}%")
             self.lbl_ram.setText(f"RAM: {ram_used_gb:.1f} GB")
             self.lbl_cpu.setStyleSheet(f"color: {'#ff4444' if cpu_usage > 85 else '#ffbb33' if cpu_usage > 60 else '#00f3ff'}; font-family: monospace; font-weight: bold;")
-        except Exception:
-            pass
+        except Exception as e:
+            # Таймер дёргает этот метод часто, поэтому логируем причину только один раз,
+            # чтобы не забить лог-файл повторяющейся одинаковой ошибкой.
+            if not getattr(self, "_hw_stats_error_logged", False):
+                app_logger.warning("Мониторинг CPU/RAM недоступен: %s", e)
+                self._hw_stats_error_logged = True
 
     def closeEvent(self, event):
         self.save_state()
+        # Освобождаем профили всех ещё не закрытых сессий, иначе при выходе
+        # Qt успевает начать удаление QWebEngineProfile раньше, чем его страниц
+        # (то же предупреждение 'Release of profile requested...', что и при
+        # удалении одной сессии вручную — см. SessionInstance.release_resources).
+        for session in self.sessions:
+            session.release_resources()
         super().closeEvent(event)
 
 if __name__ == "__main__":
