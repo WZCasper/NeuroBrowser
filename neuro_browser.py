@@ -37,45 +37,57 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import (
-    QWebEngineProfile, QWebEnginePage, QWebEngineUrlRequestInterceptor, 
-    QWebEngineScript, QWebEngineSettings
+    QWebEngineProfile, QWebEnginePage, QWebEngineUrlRequestInterceptor,
+    QWebEngineScript, QWebEngineSettings, QWebEngineUrlRequestInfo
 )
 
 class AdBlockUrlInterceptor(QWebEngineUrlRequestInterceptor):
-    """ Точечный сетевой блокиратор рекламных сетей (Сетевой уровень, не ломает плееры) """
-    AD_DOMAINS = [
-        "doubleclick.net", "googleadservices.com", "googlesyndication.com",
-        "adservice.google.com", "taboola.com", "outbrain.com",
-        "popcash.net", "popads.net", "adsterra.com", "exoclick.com",
-        "propellerads.com", "clickadu.com", "adcash.com", "juicyads.com",
-        "trafficjunky.com", "hilltopads.com", "a-ads.com", "adform.net",
-        "criteo.com", "scorecardresearch.com", "bet365.com", "1xbet.com",
-        "mostbet.com", "pin-up.club", "yandex.ru/ads", "an.yandex.ru",
-        "mc.yandex.ru", "mgid.com", "betwinner.com", "melbet.com",
-        "fonbet.ru", "parimatch.com", "vavada.com", "joycasino.com"
-    ]
+    """ Сетевой блокиратор рекламы. Блокирует только рекламные скрипты, картинки и XHR.
+    Главные документы и iframe (в том числе плееры) никогда не блокируются. """
 
-    AD_PATTERNS = [
-        "/ads.js", "/ad.js", "/pop.js", "/popup.js", "/banner/", "/banners/",
-        "adsterra", "popunder", "clickunder", "exoclick", "popcash"
-    ]
+    AD_DOMAINS = (
+        "doubleclick.net", "googleadservices.com", "googlesyndication.com",
+        "googletagservices.com", "googletagmanager.com", "adservice.google.com",
+        "taboola.com", "outbrain.com", "popcash.net", "popads.net",
+        "adsterra.com", "exoclick.com", "propellerads.com", "clickadu.com",
+        "adcash.com", "juicyads.com", "trafficjunky.com", "hilltopads.com",
+        "a-ads.com", "adform.net", "criteo.com", "scorecardresearch.com",
+        "mgid.com", "bet365.com", "1xbet.com", "mostbet.com", "pin-up.club",
+        "betwinner.com", "melbet.com", "fonbet.ru", "parimatch.com",
+        "vavada.com", "joycasino.com",
+    )
+
+    AD_PATH_MARKERS = (
+        "/ads/", "/adserver/", "/banner/", "/banners/", "/popunder",
+        "/clickunder", "/pop.js", "/popup.js", "/ads.js", "/ad.js",
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.blocked_count = 0
 
     def interceptRequest(self, info):
-        url_str = info.requestUrl().toString().lower()
-        
-        # Строгий белый список для видеопотоков и видеоплееров
-        if any(whitelist in url_str for whitelist in [".m3u8", ".mp4", ".ts", ".webm", "blob:", "player", "embed", "kodik", "collaps", "videocdn", "voidboost", "alloha", "hdrezka", "kinopoisk", "youtube"]):
+        rtype = info.resourceType()
+        # Документы и iframe не трогаем: иначе ломаются плееры
+        if rtype in (
+            QWebEngineUrlRequestInfo.ResourceType.ResourceTypeMainFrame,
+            QWebEngineUrlRequestInfo.ResourceType.ResourceTypeSubFrame,
+        ):
             return
 
-        for domain in self.AD_DOMAINS:
-            if domain in url_str:
-                info.block(True)
-                return
+        host = info.requestUrl().host().lower()
+        url_str = info.requestUrl().toString().lower()
 
-        for pattern in self.AD_PATTERNS:
-            if pattern in url_str and "player" not in url_str:
-                info.block(True)
-                return
+        if any(host == d or host.endswith("." + d) for d in self.AD_DOMAINS):
+            info.block(True)
+            self.blocked_count += 1
+            return
+
+        if any(marker in url_str for marker in self.AD_PATH_MARKERS):
+            info.block(True)
+            self.blocked_count += 1
+            return
+
 
 def get_kinopoisk_js() -> str:
     """ Кнопка бесплатного просмотра для Кинопоиска """
@@ -715,20 +727,20 @@ class SessionInstance:
             self.tabs_widget.tabBar().setTabButton(last_idx, QTabBar.ButtonPosition.RightSide, None)
             self.tabs_widget.tabBar().setTabButton(last_idx, QTabBar.ButtonPosition.LeftSide, None)
 
-    def handle_fullscreen(self, request):
-        """ Поддержка полноэкранного режима плеера """
+    def handle_fullscreen(self, request, view):
+        """ Полноэкранный режим плеера: запрос от сайта (кнопка плеера) """
         request.accept()
         if request.toggleOn():
-            self.parent_window.showFullScreen()
+            self.parent_window.enter_video_fullscreen(view)
         else:
-            self.parent_window.showNormal()
+            self.parent_window.exit_video_fullscreen()
 
     def add_tab(self, url_str="about:home") -> QWebEngineView:
         page = QWebEnginePage(self.profile, self.parent_window)
-        page.fullScreenRequested.connect(self.handle_fullscreen)
 
         view = QWebEngineView()
         view.setPage(page)
+        page.fullScreenRequested.connect(lambda req, v=view: self.handle_fullscreen(req, v))
 
         view.urlChanged.connect(lambda url, v=view: self.on_view_url_changed(url, v))
         view.titleChanged.connect(lambda title, v=view: self.on_view_title_changed(title, v))
@@ -968,6 +980,76 @@ class NeuroBrowserApp(QMainWindow):
         if self.sessions and 0 <= self.active_session_index < len(self.sessions):
             return self.sessions[self.active_session_index]
         return None
+
+    def enter_video_fullscreen(self, view):
+        """ Полный экран только для плеера: вкладка переносится в отдельное окно """
+        if getattr(self, "_fs_view", None) is not None:
+            return
+        session = self.get_active_session()
+        if session is None:
+            return
+        tabs = session.tabs_widget
+        idx = tabs.indexOf(view)
+        if idx < 0:
+            return
+
+        self._fs_view = view
+        self._fs_session = session
+        self._fs_index = idx
+        self._fs_restore_tab_label = tabs.tabText(idx)
+
+        self._fs_window = QWidget()
+        self._fs_window.setWindowTitle("NeuroBrowser — Полный экран")
+        self._fs_window.setStyleSheet("background-color: #000000;")
+        self._fs_layout = QVBoxLayout(self._fs_window)
+        self._fs_layout.setContentsMargins(0, 0, 0, 0)
+        self._fs_layout.setSpacing(0)
+
+        # Перенос view без уничтожения и без потери состояния видео
+        tabs.removeTab(idx)
+        self._fs_layout.addWidget(view)
+        view.setParent(self._fs_window)
+
+        self._fs_window.installEventFilter(self)
+        view.installEventFilter(self)
+        self._fs_window.showFullScreen()
+        view.setFocus()
+
+    def exit_video_fullscreen(self):
+        """ Возврат вкладки на её место из полного экрана """
+        view = getattr(self, "_fs_view", None)
+        if view is None:
+            return
+        session = getattr(self, "_fs_session", None)
+        idx = getattr(self, "_fs_index", 0)
+
+        view.removeEventFilter(self)
+        self._fs_window.removeEventFilter(self)
+        self._fs_layout.removeWidget(view)
+
+        if session is not None:
+            tabs = session.tabs_widget
+            insert_at = min(idx, tabs.count())
+            tabs.insertTab(insert_at, view, self._fs_restore_tab_label)
+            tabs.setCurrentIndex(insert_at)
+
+        self._fs_window.hide()
+        self._fs_window.deleteLater()
+        self._fs_view = None
+        self._fs_session = None
+        self._fs_window = None
+        self._fs_layout = None
+        self.activateWindow()
+
+    def eventFilter(self, obj, event):
+        """ Esc и F11 выходят из полного экрана плеера, где бы ни был фокус """
+        from PyQt6.QtCore import QEvent
+        if (getattr(self, "_fs_view", None) is not None
+                and event.type() == QEvent.Type.KeyPress
+                and event.key() in (Qt.Key.Key_Escape, Qt.Key.Key_F11)):
+            self.exit_video_fullscreen()
+            return True
+        return super().eventFilter(obj, event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Delete and not self.url_input.hasFocus():
