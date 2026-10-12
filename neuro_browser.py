@@ -9,7 +9,7 @@ from logging.handlers import RotatingFileHandler
 from urllib.parse import quote_plus
 import psutil
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.2"
 
 # Настройка процессов Windows для иконки в панели задач
 APP_ID = 'casper.neurobrowser.2.0'
@@ -1366,6 +1366,43 @@ class NeuroBrowserApp(QMainWindow):
             session.release_resources()
         super().closeEvent(event)
 
+def diagnose_chromium_flags():
+    """ Диагностика: проверяет, дошли ли флаги из QTWEBENGINE_CHROMIUM_FLAGS до
+    реального процесса QtWebEngineProcess (на некоторых платформах/версиях Qt
+    отдельные флаги, включая --disable-web-security, могут не доходить до
+    процесса, даже если корректно заданы в коде — это нужно проверить именно
+    там, где запущено приложение, результат пишется в neurobrowser.log). """
+    try:
+        current = psutil.Process()
+        found_any = False
+        for child in current.children(recursive=True):
+            try:
+                name = child.name()
+                if "QtWebEngineProcess" not in name:
+                    continue
+                found_any = True
+                cmdline = child.cmdline()
+                cmdline_str = " ".join(cmdline)
+                has_web_security_flag = "--disable-web-security" in cmdline
+                app_logger.info(
+                    "ДИАГНОСТИКА ФЛАГОВ: процесс %s (pid=%s)\n"
+                    "  Полная командная строка: %s\n"
+                    "  --disable-web-security %s в командной строке процесса",
+                    name, child.pid, cmdline_str,
+                    "ПРИСУТСТВУЕТ" if has_web_security_flag else "ОТСУТСТВУЕТ"
+                )
+            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                app_logger.warning("ДИАГНОСТИКА ФЛАГОВ: не удалось прочитать дочерний процесс: %s", e)
+        if not found_any:
+            app_logger.info(
+                "ДИАГНОСТИКА ФЛАГОВ: процесс QtWebEngineProcess ещё не найден среди дочерних "
+                "(он запускается при первой загрузке страницы — это нормально, если ни одна "
+                "вкладка ещё не успела загрузиться на момент проверки)"
+            )
+    except Exception as e:
+        app_logger.error("ДИАГНОСТИКА ФЛАГОВ: ошибка диагностики: %s", e)
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
@@ -1375,4 +1412,11 @@ if __name__ == "__main__":
 
     window = NeuroBrowserApp(sys_icon)
     window.show()
+
+    # Диагностика флагов Chromium: один раз, через 8 секунд после старта — этого
+    # времени достаточно, чтобы восстановленные сессии успели начать загрузку
+    # страниц и запустить QtWebEngineProcess. Результат смотреть в neurobrowser.log
+    # (в %APPDATA%\NeuroBrowser\), искать строку "ДИАГНОСТИКА ФЛАГОВ".
+    QTimer.singleShot(8000, diagnose_chromium_flags)
+
     sys.exit(app.exec())
