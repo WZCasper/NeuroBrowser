@@ -9,7 +9,7 @@ from logging.handlers import RotatingFileHandler
 from urllib.parse import quote_plus
 import psutil
 
-APP_VERSION = "2.1.2"
+APP_VERSION = "2.1.3"
 
 # Настройка процессов Windows для иконки в панели задач
 APP_ID = 'casper.neurobrowser.2.0'
@@ -83,7 +83,7 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     "--disable-web-security"
 )
 
-from PyQt6.QtCore import QUrl, QTimer, Qt
+from PyQt6.QtCore import QUrl, QTimer, Qt, QEvent
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QBrush, QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -907,32 +907,20 @@ class SessionInstance:
             if isinstance(v, QWebEngineView):
                 page = v.page()
                 if page is not None:
-                    # Останавливаем любую активную загрузку/воспроизведение перед удалением
-                    page.setUrl(QUrl("about:blank"))
+                    # Раньше здесь был page.setUrl("about:blank") перед deleteLater() —
+                    # это асинхронная операция, и deleteLater() сразу следом мог
+                    # застать страницу посреди навигации, вызывая состояние гонки
+                    # внутри Chromium (воспроизведено: "Release of profile requested..."
+                    # и даже segfault — именно для вкладки, добавленной незадолго до
+                    # удаления сессии, когда загрузка ещё могла быть не завершена).
+                    # deleteLater() сам по себе корректно останавливает активность
+                    # страницы при удалении — промежуточный переход не нужен.
                     page.deleteLater()
                 v.setParent(None)
 
         # Профиль освобождается в следующем цикле событий, после того как Qt
         # обработает deleteLater() для всех его страниц выше.
         QTimer.singleShot(0, self.profile.deleteLater)
-
-class _FullscreenPlayerWindow(QWidget):
-    """ Отдельное окно полноэкранного плеера. Пользователь может закрыть его
-    системным крестиком в заголовке окна — это НЕ должно просто закрыть окно
-    (тогда QWebEngineView с активным видео потеряется: не вернётся на вкладку,
-    а звук продолжит идти в оторванном от интерфейса виджете). Поэтому крестик
-    перенаправляется на тот же exit_video_fullscreen, что и Esc/F11. """
-
-    def __init__(self, main_window):
-        super().__init__()
-        self._main_window = main_window
-        self.setWindowTitle("NeuroBrowser — Полный экран")
-        self.setWindowFlag(Qt.WindowType.Window, True)
-
-    def closeEvent(self, event):
-        event.ignore()  # не даём Qt уничтожить окно и его дочерний view напрямую
-        self._main_window.exit_video_fullscreen()
-
 
 class NeuroBrowserApp(QMainWindow):
     def __init__(self, app_icon):
@@ -972,6 +960,7 @@ class NeuroBrowserApp(QMainWindow):
         header = QFrame()
         header.setObjectName("header")
         header.setFixedHeight(56)
+        self.header = header  # нужен для скрытия/показа при входе/выходе из полного экрана плеера
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(12, 0, 12, 0)
 
@@ -1025,6 +1014,7 @@ class NeuroBrowserApp(QMainWindow):
         body_splitter = QSplitter(Qt.Orientation.Horizontal)
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
+        self.sidebar = sidebar  # нужен для скрытия/показа при входе/выходе из полного экрана плеера
         sidebar.setFixedWidth(220)
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(8, 8, 8, 8)
@@ -1092,7 +1082,15 @@ class NeuroBrowserApp(QMainWindow):
         return None
 
     def enter_video_fullscreen(self, view):
-        """ Полный экран только для плеера: вкладка переносится в отдельное окно """
+        """ Полный экран плеера БЕЗ переноса QWebEngineView в отдельное окно.
+        Перенос view между окнами (setParent на новый top-level) — известная,
+        давняя проблема самого QtWebEngine: после такой операции наведение мыши
+        (hover) переставало доходить до страницы (встречается в отчётах об ошибках
+        Qt, начиная с версии 5.6 и вплоть до 6.11), из-за чего элементы управления
+        плеера, которые появляются по hover, не показывались. Поэтому view остаётся
+        на своём месте в layout, а разворачивается само главное окно: прячутся
+        header, sidebar и панель вкладок (tabBar), остаётся только содержимое
+        активной вкладки на весь экран. """
         if getattr(self, "_fs_view", None) is not None:
             return
         session = self.get_active_session()
@@ -1105,67 +1103,59 @@ class NeuroBrowserApp(QMainWindow):
 
         self._fs_view = view
         self._fs_session = session
-        self._fs_index = idx
-        self._fs_restore_tab_label = tabs.tabText(idx)
 
-        self._fs_window = _FullscreenPlayerWindow(self)
-        self._fs_window.setStyleSheet("background-color: #000000;")
-        self._fs_layout = QVBoxLayout(self._fs_window)
-        self._fs_layout.setContentsMargins(0, 0, 0, 0)
-        self._fs_layout.setSpacing(0)
+        self.header.hide()
+        self.sidebar.hide()
+        tabs.tabBar().hide()
+        # QTabWidget рисует рамку/отступы вокруг содержимого вкладки по умолчанию —
+        # в полноэкранном режиме это нежелательная чёрная кайма вокруг видео.
+        tabs.setDocumentMode(True)
 
-        # Перенос view без уничтожения и без потери состояния видео
-        tabs.removeTab(idx)
-        self._fs_layout.addWidget(view)
-        view.setParent(self._fs_window)
-        # Без явного show() после смены родителя QWebEngineView иногда не перерисовывается
-        # (остаётся чёрным), т.к. его composited-слой привязан к старому окну.
-        view.show()
-
-        self._fs_window.installEventFilter(self)
-        view.installEventFilter(self)
-        self._fs_window.showFullScreen()
+        self.showFullScreen()
+        self.activateWindow()
+        self.raise_()
         view.setFocus()
+        # Реальный клавиатурный ввод при фокусе на QWebEngineView получает его
+        # внутренний focusProxy() (отдельный QWidget), а не сам view — поэтому
+        # фильтр событий ставится именно на него (подтверждено на Windows:
+        # обычный keyPressEvent главного окна и eventFilter на самом view Esc
+        # не перехватывали, пока фильтр не был поставлен на focusProxy()).
+        focus_proxy = view.focusProxy()
+        self._fs_focus_proxy = focus_proxy
+        if focus_proxy is not None:
+            focus_proxy.installEventFilter(self)
+            focus_proxy.setFocus()
 
     def exit_video_fullscreen(self):
-        """ Возврат вкладки на её место из полного экрана. Вызывается и по Esc/F11
-        (через eventFilter), и системным крестиком окна (через _FullscreenPlayerWindow
-        .closeEvent) — поэтому защищена от повторного вызова, если оба пути сработают
-        почти одновременно. """
+        """ Возврат из полноэкранного режима плеера: показывает обратно header,
+        sidebar и панель вкладок, возвращает окно в обычный режим. Вызывается и
+        по Esc/F11 (через keyPressEvent), и системным сворачиванием/выходом из
+        showFullScreen — защищена от повторного вызова. """
         view = getattr(self, "_fs_view", None)
         if view is None:
             return  # уже вышли из полноэкранного режима — ничего не делаем
         session = getattr(self, "_fs_session", None)
-        idx = getattr(self, "_fs_index", 0)
-        fs_window = self._fs_window
 
-        # Сразу обнуляем _fs_view: если exit_video_fullscreen вызовется повторно
-        # (например, closeEvent успеет сработать после уже начатого выхода по Esc),
-        # проверка выше отсечёт повторный проход раньше, чем он тронет виджеты.
         self._fs_view = None
-
-        view.removeEventFilter(self)
-        fs_window.removeEventFilter(self)
-        self._fs_layout.removeWidget(view)
-        view.setParent(None)
-
-        if session is not None:
-            tabs = session.tabs_widget
-            insert_at = min(idx, tabs.count())
-            tabs.insertTab(insert_at, view, self._fs_restore_tab_label)
-            tabs.setCurrentIndex(insert_at)
-            view.show()
-
-        fs_window.hide()
-        fs_window.deleteLater()
         self._fs_session = None
-        self._fs_window = None
-        self._fs_layout = None
+        focus_proxy = getattr(self, "_fs_focus_proxy", None)
+        if focus_proxy is not None:
+            focus_proxy.removeEventFilter(self)
+        self._fs_focus_proxy = None
+
+        self.header.show()
+        self.sidebar.show()
+        if session is not None:
+            session.tabs_widget.tabBar().show()
+
+        self.showNormal()
         self.activateWindow()
 
     def eventFilter(self, obj, event):
-        """ Esc и F11 выходят из полного экрана плеера, где бы ни был фокус """
-        from PyQt6.QtCore import QEvent
+        """ Esc/F11 выходят из полноэкранного режима плеера. Основной перехват —
+        здесь, а не в keyPressEvent главного окна, потому что реальный фокус при
+        работе с QWebEngineView лежит на его внутреннем focusProxy(), который
+        подписывается на этот фильтр в enter_video_fullscreen. """
         if (getattr(self, "_fs_view", None) is not None
                 and event.type() == QEvent.Type.KeyPress
                 and event.key() in (Qt.Key.Key_Escape, Qt.Key.Key_F11)):
@@ -1174,6 +1164,17 @@ class NeuroBrowserApp(QMainWindow):
         return super().eventFilter(obj, event)
 
     def keyPressEvent(self, event):
+        # Esc/F11 для выхода из полноэкранного режима плеера. QWebEngineView не
+        # передаёт необработанные клавиши вверх по дереву родителей так, как
+        # обычные QWidget — его реальный фокус держит внутренний focusProxy(),
+        # поэтому полагаться только на обычный keyPressEvent главного окна
+        # недостаточно: он сработает, только если фокус не внутри самого view.
+        # Основной перехват — через eventFilter на focusProxy() активной вкладки
+        # (устанавливается в enter_video_fullscreen); это — подстраховка на
+        # случай, если фокус окажется вне view (например, сразу после входа).
+        if getattr(self, "_fs_view", None) is not None and event.key() in (Qt.Key.Key_Escape, Qt.Key.Key_F11):
+            self.exit_video_fullscreen()
+            return
         if event.key() == Qt.Key.Key_Delete and not self.url_input.hasFocus():
             self.delete_session()
         else:
@@ -1357,6 +1358,14 @@ class NeuroBrowserApp(QMainWindow):
                 self._hw_stats_error_logged = True
 
     def closeEvent(self, event):
+        # Если окно закрывают прямо в полноэкранном режиме плеера, сначала выходим
+        # из него и возвращаем обычное состояние окна — закрытие из showFullScreen()
+        # ведёт себя менее предсказуемо при последующем удалении дочерних виджетов
+        # (подтверждено: без этого шага профиль сессии не успевал освободиться
+        # корректно именно в этом сценарии, хотя обычное закрытие работает чисто).
+        if getattr(self, "_fs_view", None) is not None:
+            self.exit_video_fullscreen()
+
         self.save_state()
         # Освобождаем профили всех ещё не закрытых сессий, иначе при выходе
         # Qt успевает начать удаление QWebEngineProfile раньше, чем его страниц
